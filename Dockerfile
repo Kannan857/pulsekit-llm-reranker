@@ -1,12 +1,12 @@
-# Use a vLLM base image for compatibility
+# Use the latest vLLM base image for best compatibility
 FROM vllm/vllm-openai:latest
 
 # Set the working directory
 WORKDIR /app
 
-# Copy requirements and install dependencies first for better caching
+# Copy requirements and install dependencies
 COPY requirements.txt .
-RUN pip install --no-cache-dir --trusted-host pypi.org --trusted-host files.pythonhosted.org -r requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy the rest of the application code
 COPY ./app /app/app
@@ -15,9 +15,6 @@ COPY ./scripts /app/scripts
 # Expose the port the app runs on
 EXPOSE 8000
 
-# Add this line to reset any default entrypoint from the base image
+# Reset the entrypoint and set the correct command to run the application
 ENTRYPOINT []
-
-# Command to run the application
-# This will start the FastAPI server using Uvicorn
 CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
