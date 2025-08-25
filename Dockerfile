@@ -1,5 +1,5 @@
 # Use a vLLM base image for compatibility
-FROM vllm/vllm-openai:v0.4.0-cuda12.1
+FROM vllm/vllm-openai:v0.4.2
 
 # Set the working directory
 WORKDIR /app
