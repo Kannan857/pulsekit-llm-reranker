@@ -1,7 +1,11 @@
+# Core application framework
 fastapi
 uvicorn[standard]
 python-dotenv
-torch --index-url https://download.pytorch.org/whl/cu121
-vllm
+
+# Reranker library
 sentence-transformers
-deepgram-sdk
+
+# Pin transformers to a version compatible with vllm v0.4.2
+# This prevents sentence-transformers from installing an incompatible version.
+transformers==4.39.3
