@@ -15,6 +15,9 @@ COPY ./scripts /app/scripts
 # Expose the port the app runs on
 EXPOSE 8000
 
+# Add this line to reset any default entrypoint from the base image
+ENTRYPOINT []
+
 # Command to run the application
 # This will start the FastAPI server using Uvicorn
 CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
