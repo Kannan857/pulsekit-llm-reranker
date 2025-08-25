@@ -1,12 +1,12 @@
 # Use a vLLM base image for compatibility
-FROM vllm/vllm-openai:latest
+FROM vllm/vllm-openai:v0.5.1.post1-cuda12.1
 
 # Set the working directory
 WORKDIR /app
 
 # Copy requirements and install dependencies first for better caching
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir --trusted-host pypi.org --trusted-host files.pythonhosted.org -r requirements.txt
 
 # Copy the rest of the application code
 COPY ./app /app/app
