@@ -1,5 +1,5 @@
 # Use a vLLM base image for compatibility
-FROM vllm/vllm-openai:v0.4.2
+FROM vllm/vllm-openai:latest
 
 # Set the working directory
 WORKDIR /app
