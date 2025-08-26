@@ -6,16 +6,19 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 
-# 1) Dep layer stays cacheable
+# Install tini so ENTRYPOINT works
+RUN apt-get update && apt-get install -y --no-install-recommends tini ca-certificates \
+  && rm -rf /var/lib/apt/lists/*
+
 COPY requirements.txt /app/
 RUN pip install --no-cache-dir -r requirements.txt
-# requirements.txt should NOT include: torch, vllm
 
-# 2) App code
 COPY app /app/app
 COPY start.sh /app/start.sh
 RUN chmod +x /app/start.sh
 
 EXPOSE 8000
+
+# tini will properly forward signals and reap zombies
 ENTRYPOINT ["/usr/bin/tini","--"]
-CMD ["/bin/bash","/app/start.sh"]
+CMD ["/app/start.sh"]
