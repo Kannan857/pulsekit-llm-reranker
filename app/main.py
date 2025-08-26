@@ -2,6 +2,7 @@
 import json
 import time
 import inspect
+import uuid
 from fastapi import FastAPI, Request
 from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -40,20 +41,13 @@ async def _startup():
 def health():
     return {"ok": True}
 
-# Helpful root for platforms that probe "/"
 @app.get("/")
 def root():
     return {"ok": True, "service": "frontoffice-llm"}
 
-# Debug: see the detected add_request signature at runtime
 @app.get("/__debug_sig")
 def debug_sig():
-    try:
-        engine = get_llm_engine()
-        sig = get_add_request_signature_str()
-        return {"add_request_signature": sig}
-    except Exception as e:
-        return {"error": str(e)}
+    return {"add_request_signature": get_add_request_signature_str()}
 
 @app.post("/chat", response_model=ChatResponse)
 async def chat(req: ChatRequest):
@@ -73,7 +67,7 @@ def rerank(req: RerankRequest):
         results=[RerankResponseItem(document=d, score=float(s)) for d, s in ranked]
     )
 
-# ---------- Streaming SSE endpoint (for TTS/barge-in) ----------
+# ---------- Streaming SSE endpoint (V1 collector-based) ----------
 @app.post("/chat/stream")
 async def chat_stream(req: ChatRequest, request: Request):
     engine = get_llm_engine()
@@ -84,38 +78,42 @@ async def chat_stream(req: ChatRequest, request: Request):
         stop=req.stop or [],
     )
 
-    # Detect the right variant for this build
+    # Figure out the proper add_request signature for this build
     sig = inspect.signature(engine.add_request)
     names = list(sig.parameters.keys())
 
     async def add_request(prompt, params):
         if "request_id" in names:
-            # choose correct keyword for SamplingParams
-            rid = __import__("uuid").uuid4().hex
+            rid = uuid.uuid4().hex
             if "params" in names:
-                return await engine.add_request(request_id=rid, prompt=prompt, params=params)
+                collector = await engine.add_request(request_id=rid, prompt=prompt, params=params)
             elif "sampling_params" in names:
-                return await engine.add_request(request_id=rid, prompt=prompt, sampling_params=params)
+                collector = await engine.add_request(request_id=rid, prompt=prompt, sampling_params=params)
             else:
-                return await engine.add_request(rid, prompt, params)
+                collector = await engine.add_request(rid, prompt, params)
+            return collector, rid
         elif "params" in names:
-            return await engine.add_request(prompt=prompt, params=params)
+            collector = await engine.add_request(prompt=prompt, params=params)
+            return collector, getattr(collector, "request_id", uuid.uuid4().hex)
         elif "sampling_params" in names:
-            return await engine.add_request(prompt=prompt, sampling_params=params)
+            collector = await engine.add_request(prompt=prompt, sampling_params=params)
+            return collector, getattr(collector, "request_id", uuid.uuid4().hex)
         else:
-            return await engine.add_request(prompt, params)
+            collector = await engine.add_request(prompt, params)
+            return collector, getattr(collector, "request_id", uuid.uuid4().hex)
 
     async def gen():
         started = time.time()
-        req_id = await add_request(req.prompt, params)
+        collector, rid = await add_request(req.prompt, params)
 
-        # Emit a started event (helps clients correlate/cancel)
-        yield f'data: {json.dumps({"type":"started","request_id":req_id})}\n\n'
+        # Emit a started event
+        yield f'data: {json.dumps({"type":"started","request_id":rid})}\n\n'
 
         prev = ""
         last = None
         try:
-            async for out in engine.get_generator(req_id):
+            # Stream directly from the collector (V1 pattern)
+            async for out in collector:
                 last = out
                 text_so_far = out.outputs[0].text
                 delta = text_so_far[len(prev):]
@@ -123,15 +121,15 @@ async def chat_stream(req: ChatRequest, request: Request):
                     prev = text_so_far
                     yield f'data: {json.dumps({"type":"delta","delta":delta})}\n\n'
 
-                # client closed connection (barge-in) -> cancel request
+                # client closed connection (barge-in) -> done
                 if await request.is_disconnected():
                     try:
-                        await engine.abort_request(req_id)
+                        await engine.abort_request(rid)
                     except Exception:
                         pass
                     return
 
-            # Final usage (if available)
+            # Final usage if available
             usage = {}
             if last and getattr(last, "metrics", None):
                 m = last.metrics
@@ -150,6 +148,6 @@ async def chat_stream(req: ChatRequest, request: Request):
     headers = {
         "Cache-Control": "no-cache",
         "Connection": "keep-alive",
-        "X-Accel-Buffering": "no",  # disable proxy buffering if present
+        "X-Accel-Buffering": "no",
     }
     return StreamingResponse(gen(), headers=headers, media_type="text/event-stream")
