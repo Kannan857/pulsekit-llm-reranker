@@ -4,11 +4,11 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1
 
-WORKDIR /app
+# curl for start.sh readiness checks
+RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
 
-# Install tini so ENTRYPOINT works
-RUN apt-get update && apt-get install -y --no-install-recommends tini ca-certificates \
-  && rm -rf /var/lib/apt/lists/*
+WORKDIR /app
 
 COPY requirements.txt /app/
 RUN pip install --no-cache-dir -r requirements.txt
@@ -18,7 +18,4 @@ COPY start.sh /app/start.sh
 RUN chmod +x /app/start.sh
 
 EXPOSE 8000
-
-# tini will properly forward signals and reap zombies
-ENTRYPOINT ["/usr/bin/tini","--"]
 CMD ["/app/start.sh"]
