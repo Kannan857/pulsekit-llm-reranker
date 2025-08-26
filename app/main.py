@@ -1,30 +1,41 @@
 # app/main.py
-import os, json, asyncio, time
-from typing import AsyncIterator, Optional
-from fastapi import FastAPI, Request
-from fastapi.responses import StreamingResponse, JSONResponse
-from fastapi.middleware.cors import CORSMiddleware
+import os
+import json
+import time
+import asyncio
+from typing import Optional, AsyncIterator
+
 import httpx
+from fastapi import FastAPI, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse, JSONResponse
 
 from app.inference import load_models, rerank_documents
 from app.schemas import (
-    ChatRequest, ChatResponse,
-    RerankRequest, RerankResponse, RerankResponseItem
+    ChatRequest,
+    ChatResponse,
+    RerankRequest,
+    RerankResponse,
+    RerankResponseItem,
 )
 
 app = FastAPI(title="Front Office LLM (OpenAI proxy) + Mini Reranker")
 
-# CORS (relax now; tighten in prod)
+# -------- CORS (relax now; tighten in prod) --------
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"], allow_methods=["*"], allow_headers=["*"],
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
-# ---- Config / State ----
+# -------- Config / State --------
 DEFAULT_VLLM_PORT = int(os.getenv("VLLM_PORT", "8001"))
 PROBE_RANGE = int(os.getenv("VLLM_PROBE_RANGE", "3"))  # try 8001..8001+range
-OPENAI_BASE_ENV = os.getenv("LLM_OPENAI_BASE")  # force URL if set
-MODEL_ID = os.getenv("LLM_MODEL", "hugging-quants/Meta-Llama-3.1-8B-Instruct-AWQ-INT4")
+OPENAI_BASE_ENV = os.getenv("LLM_OPENAI_BASE")  # optional override, e.g. http://127.0.0.1:8001
+MODEL_ID = os.getenv(
+    "LLM_MODEL", "hugging-quants/Meta-Llama-3.1-8B-Instruct-AWQ-INT4"
+)
 
 class VLLMState:
     client: Optional[httpx.AsyncClient] = None
@@ -32,16 +43,15 @@ class VLLMState:
 
 state = VLLMState()
 
-# ---- Helpers ---------------------------------------------------------------
 
+# -------- Helpers --------
 def _llama31_chat_template(user: str, system: Optional[str] = None) -> str:
     """
     Minimal Llama 3/3.1 chat template rendered to a single prompt string.
-    Works even if the model mirror lacks a tokenizer chat_template.
+    Works even if the model/mirror lacks a tokenizer chat_template.
     """
     sys = (system or "You are a helpful assistant.").strip()
     usr = (user or "").strip()
-    # Llama-3.x special tokens
     return (
         "<|begin_of_text|>"
         "<|start_header_id|>system<|end_header_id|>\n"
@@ -51,8 +61,12 @@ def _llama31_chat_template(user: str, system: Optional[str] = None) -> str:
         "<|start_header_id|>assistant<|end_header_id|>\n"
     )
 
-async def _probe_vllm_base() -> str:
-    """Find a working OpenAI base URL. Prefer env; else probe localhost ports."""
+
+async def _probe_vLLM_base() -> str:
+    """
+    Find a working OpenAI base URL. Prefer explicit env; else probe localhost ports.
+    """
+    # explicit override
     if OPENAI_BASE_ENV:
         base = OPENAI_BASE_ENV.rstrip("/")
         async with httpx.AsyncClient(timeout=2.0) as cx:
@@ -61,7 +75,9 @@ async def _probe_vllm_base() -> str:
                 if r.status_code == 200:
                     return base
             except Exception:
-                pass
+                pass  # fall through
+
+    # probe localhost ports
     for off in range(PROBE_RANGE + 1):
         url = f"http://127.0.0.1:{DEFAULT_VLLM_PORT + off}"
         try:
@@ -71,30 +87,58 @@ async def _probe_vllm_base() -> str:
                     return url
         except Exception:
             continue
+
     raise RuntimeError("Could not reach vLLM OpenAI server on expected ports.")
 
+
 async def _ensure_client(force_refresh: bool = False) -> httpx.AsyncClient:
-    """Ensure we have a connected AsyncClient with correct base_url."""
+    """
+    Ensure we have a persistent AsyncClient with the correct base_url.
+    """
     if force_refresh and state.client:
-        await state.client.aclose()
+        try:
+            await state.client.aclose()
+        except Exception:
+            pass
         state.client = None
         state.base_url = None
+
     if state.client is None or state.base_url is None:
-        base = await _probe_vllm_base()
+        base = await _probe_vLLM_base()
         state.client = httpx.AsyncClient(base_url=base, timeout=None)
         state.base_url = base
+
     return state.client
 
-# ---- Lifecycle -------------------------------------------------------------
 
+# -------- Lifecycle --------
 @app.on_event("startup")
 async def _startup():
-    load_models()  # CPU reranker
-    # Prime vLLM client (wait until it is reachable)
-    await _ensure_client(force_refresh=True)
+    # load CPU reranker
+    load_models()
 
-# ---- Diagnostics -----------------------------------------------------------
+    # warm vLLM in the background without failing startup
+    async def _bg_warm():
+        for _ in range(180):  # up to ~3 minutes
+            try:
+                await _ensure_client(force_refresh=True)
+                return
+            except Exception:
+                await asyncio.sleep(1)
 
+    asyncio.create_task(_bg_warm())
+
+
+@app.on_event("shutdown")
+async def _shutdown():
+    if state.client:
+        try:
+            await state.client.aclose()
+        except Exception:
+            pass
+
+
+# -------- Diagnostics --------
 @app.get("/health")
 async def health():
     try:
@@ -105,9 +149,11 @@ async def health():
     except Exception as e:
         return {"ok": False, "vllm_base": state.base_url, "error": str(e)}
 
+
 @app.get("/")
 def root():
     return {"ok": True, "service": "frontoffice-llm-proxy"}
+
 
 @app.get("/__debug_base")
 async def debug_base():
@@ -117,14 +163,15 @@ async def debug_base():
         "probe_range": PROBE_RANGE,
     }
 
-# ---- Core endpoints --------------------------------------------------------
 
+# -------- Core: /chat (with safe fallback) --------
 @app.post("/chat", response_model=ChatResponse)
 async def chat(req: ChatRequest):
     """
     1) Try /v1/chat/completions
-    2) On failure (non-200 or {"error":"Internal Server Error"}), fall back to
-       /v1/completions with a Llama-3.1 string template.
+    2) On non-200 or Internal Server Error, fall back to /v1/completions
+       using a manual Llama-3.1 prompt template.
+    Never raise; return JSON errors on failure.
     """
     payload_chat = {
         "model": MODEL_ID,
@@ -136,22 +183,23 @@ async def chat(req: ChatRequest):
         "stream": False,
     }
 
-    async def call_chat_once() -> httpx.Response:
+    async def _post_chat_once():
         cx = await _ensure_client()
         return await cx.post("/v1/chat/completions", json=payload_chat)
 
     # First attempt: chat/completions
     try:
-        resp = await call_chat_once()
+        resp = await _post_chat_once()
         if resp.status_code != 200:
-            # If the vLLM server changed ports, refresh & retry once
-            cx = await _ensure_client(force_refresh=True)
-            resp = await cx.post("/v1/chat/completions", json=payload_chat)
+            # re-detect (port change etc.) and retry once
+            await _ensure_client(force_refresh=True)
+            resp = await _post_chat_once()
     except Exception as e:
-        # Connection-level issue
-        return JSONResponse(status_code=502, content={"error": "vLLM connection failed", "detail": str(e)})
+        return JSONResponse(
+            status_code=502,
+            content={"error": "vLLM connection failed", "detail": str(e)},
+        )
 
-    # If 200 OK and sane body, return it
     if resp.status_code == 200:
         try:
             data = resp.json()
@@ -161,18 +209,18 @@ async def chat(req: ChatRequest):
             # fall through to completions fallback
             pass
     else:
-        # If vLLM explicitly says Internal Server Error, fall back
+        # If explicit "Internal Server Error", use fallback; else bubble details
         try:
             j = resp.json()
-            if isinstance(j, dict) and j.get("error") == "Internal Server Error":
-                pass  # trigger fallback below
-            else:
-                # non-200 other error: return details
-                return JSONResponse(status_code=502, content={"error": "vLLM non-200", "status": resp.status_code, "body": j})
         except Exception:
-            return JSONResponse(status_code=502, content={"error": "vLLM non-200", "status": resp.status_code, "raw": resp.text})
+            j = {"raw": resp.text}
+        if not (isinstance(j, dict) and j.get("error") == "Internal Server Error"):
+            return JSONResponse(
+                status_code=502,
+                content={"error": "vLLM non-200", "status": resp.status_code, "body": j},
+            )
 
-    # Fallback: /v1/completions with manual Llama-3.1 template
+    # Fallback: /v1/completions with manual template
     prompt = _llama31_chat_template(req.prompt)
     payload_comp = {
         "model": MODEL_ID,
@@ -187,33 +235,45 @@ async def chat(req: ChatRequest):
         cx = await _ensure_client()
         r2 = await cx.post("/v1/completions", json=payload_comp)
         if r2.status_code != 200:
-            # refresh base and retry once
-            cx = await _ensure_client(force_refresh=True)
+            await _ensure_client(force_refresh=True)
             r2 = await cx.post("/v1/completions", json=payload_comp)
     except Exception as e:
-        return JSONResponse(status_code=502, content={"error": "vLLM connection failed (fallback)", "detail": str(e)})
+        return JSONResponse(
+            status_code=502,
+            content={"error": "vLLM connection failed (fallback)", "detail": str(e)},
+        )
 
     if r2.status_code != 200:
         try:
             body = r2.json()
         except Exception:
             body = {"raw": r2.text}
-        return JSONResponse(status_code=502, content={"error": "vLLM non-200 (fallback)", "status": r2.status_code, "body": body})
+        return JSONResponse(
+            status_code=502,
+            content={"error": "vLLM non-200 (fallback)", "status": r2.status_code, "body": body},
+        )
 
     data2 = r2.json()
     try:
         text2 = data2["choices"][0]["text"]
     except Exception:
-        return JSONResponse(status_code=502, content={"error": "unexpected vLLM payload (fallback)", "body": data2})
+        return JSONResponse(
+            status_code=502,
+            content={"error": "unexpected vLLM payload (fallback)", "body": data2},
+        )
     return ChatResponse(text=text2.strip())
 
+
+# -------- Rerank --------
 @app.post("/rerank", response_model=RerankResponse)
 def rerank(req: RerankRequest):
     ranked = rerank_documents(req.query, req.documents, top_k=req.top_k)
-    return RerankResponse(results=[RerankResponseItem(document=d, score=float(s)) for d, s in ranked])
+    return RerankResponse(
+        results=[RerankResponseItem(document=d, score=float(s)) for d, s in ranked]
+    )
 
-# ----- Streaming SSE: chat first, then completions fallback -----------------
 
+# -------- Streaming SSE: try chat → fallback to completions --------
 @app.post("/chat/stream")
 async def chat_stream(req: ChatRequest, request: Request):
     payload_chat = {
@@ -235,6 +295,7 @@ async def chat_stream(req: ChatRequest, request: Request):
                 body = await resp.aread()
                 yield f'data: {json.dumps({"type":"error","message":body.decode("utf-8","ignore")})}\n\n'
                 return
+            # started
             yield f'data: {json.dumps({"type":"started"})}\n\n'
             async for line in resp.aiter_lines():
                 if not line:
@@ -266,7 +327,7 @@ async def chat_stream(req: ChatRequest, request: Request):
         except Exception:
             pass
 
-        # If that didn’t work, fall back to /v1/completions with manual template
+        # Fallback to /v1/completions with manual template
         prompt = _llama31_chat_template(req.prompt)
         payload_comp = {
             "model": MODEL_ID,
@@ -277,7 +338,8 @@ async def chat_stream(req: ChatRequest, request: Request):
             "stop": req.stop or [],
             "stream": True,
         }
-        async with (await _ensure_client()).stream("POST", "/v1/completions", json=payload_comp) as resp:
+        cx = await _ensure_client()
+        async with cx.stream("POST", "/v1/completions", json=payload_comp) as resp:
             if resp.status_code != 200:
                 body = await resp.aread()
                 yield f'data: {json.dumps({"type":"error","message":body.decode("utf-8","ignore")})}\n\n'
@@ -297,7 +359,6 @@ async def chat_stream(req: ChatRequest, request: Request):
                         break
                     try:
                         obj = json.loads(data)
-                        # /v1/completions streams "text" at choices[0].text
                         delta = obj["choices"][0].get("text", "")
                     except Exception:
                         delta = ""
@@ -307,5 +368,9 @@ async def chat_stream(req: ChatRequest, request: Request):
                 if await request.is_disconnected():
                     return
 
-    headers = {"Cache-Control":"no-cache","Connection":"keep-alive","X-Accel-Buffering":"no"}
+    headers = {
+        "Cache-Control": "no-cache",
+        "Connection": "keep-alive",
+        "X-Accel-Buffering": "no",
+    }
     return StreamingResponse(gen(), headers=headers, media_type="text/event-stream")
