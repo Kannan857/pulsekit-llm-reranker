@@ -49,19 +49,32 @@ def load_models() -> None:
 async def generate_chat_response(
     prompt: str,
     *,
-    temperature: float = 0.3,
-    top_p: float = 0.85,
-    max_tokens: int = 96,
-    stop: Optional[List[str]] = None,
+    temperature: float = 0.6,
+    top_p: float = 0.9,
+    max_tokens: int = 256,
+    stop: list[str] | None = None,
 ) -> str:
     if llm_engine is None:
         raise RuntimeError("LLM engine not initialized")
+
     params = SamplingParams(
-        temperature=temperature, top_p=top_p, max_tokens=max_tokens, stop=stop or []
+        temperature=temperature,
+        top_p=top_p,
+        max_tokens=max_tokens,
+        stop=stop or [],
     )
-    req_id = await llm_engine.add_request(prompt=prompt, sampling_params=params)
-    out = await llm_engine.get_request_output(req_id, timeout=float(_env("VLLM_TIMEOUT", "90")))
-    return out.outputs[0].text
+
+    # vLLM V1 prefers positional (prompt, params). Older engines used sampling_params=...
+    try:
+        req_id = await llm_engine.add_request(prompt, params)  # V1 style
+    except TypeError:
+        req_id = await llm_engine.add_request(prompt=prompt, sampling_params=params)  # legacy
+
+    result = await llm_engine.get_request_output(
+        req_id,
+        timeout=float(os.getenv("VLLM_TIMEOUT", "90")),
+    )
+    return result.outputs[0].text
 
 def rerank_documents(query: str, documents: List[str], top_k: Optional[int] = None) -> List[Tuple[str, float]]:
     if reranker_model is None or not documents:
