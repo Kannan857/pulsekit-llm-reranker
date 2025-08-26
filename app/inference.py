@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import uuid
 import inspect
 from typing import List, Optional, Tuple
 
@@ -53,27 +54,61 @@ def load_models() -> None:
     reranker_model = CrossEncoder(rr_model_id, device=rr_device)
 
 
-async def _add_request_compat(prompt: str, params: SamplingParams):
+def _detect_add_request_variant():
     """
-    Call vLLM add_request with whatever signature this build expects:
-      - prompt=..., params=...
-      - prompt=..., sampling_params=...
-      - positional (prompt, params)
+    Return a callable that wraps llm_engine.add_request with the right signature.
+    Supports:
+      - add_request(request_id, prompt, params, ...)
+      - add_request(prompt=..., params=...)
+      - add_request(prompt=..., sampling_params=...)
+      - add_request(prompt, params)
     """
     if llm_engine is None:
         raise RuntimeError("LLM engine not initialized")
 
     sig = inspect.signature(llm_engine.add_request)
-    param_names = list(sig.parameters.keys())
+    names = list(sig.parameters.keys())
 
-    # Prefer explicit keyword names if available
-    if "params" in sig.parameters:
-        return await llm_engine.add_request(prompt=prompt, params=params)
-    if "sampling_params" in sig.parameters:
-        return await llm_engine.add_request(prompt=prompt, sampling_params=params)
+    # Variant A: V1 API that takes request_id explicitly
+    if "request_id" in names:
+        # choose keyword name for SamplingParams
+        if "params" in names:
+            async def call(prompt, params):
+                rid = uuid.uuid4().hex
+                return await llm_engine.add_request(
+                    request_id=rid, prompt=prompt, params=params
+                )
+            return call
+        elif "sampling_params" in names:
+            async def call(prompt, params):
+                rid = uuid.uuid4().hex
+                return await llm_engine.add_request(
+                    request_id=rid, prompt=prompt, sampling_params=params
+                )
+            return call
+        else:
+            # fallback to positional if only positional is supported with request_id
+            async def call(prompt, params):
+                rid = uuid.uuid4().hex
+                return await llm_engine.add_request(rid, prompt, params)
+            return call
 
-    # Fallback: positional (prompt, params)
-    return await llm_engine.add_request(prompt, params)
+    # Variant B: No request_id, but keyword 'params'
+    if "params" in names:
+        async def call(prompt, params):
+            return await llm_engine.add_request(prompt=prompt, params=params)
+        return call
+
+    # Variant C: No request_id, legacy keyword 'sampling_params'
+    if "sampling_params" in names:
+        async def call(prompt, params):
+            return await llm_engine.add_request(prompt=prompt, sampling_params=params)
+        return call
+
+    # Variant D: Positional only (prompt, params)
+    async def call(prompt, params):
+        return await llm_engine.add_request(prompt, params)
+    return call
 
 
 async def generate_chat_response(
@@ -95,7 +130,8 @@ async def generate_chat_response(
         stop=stop or [],
     )
 
-    req_id = await _add_request_compat(prompt, params)
+    add_request = _detect_add_request_variant()
+    req_id = await add_request(prompt, params)
 
     out = await llm_engine.get_request_output(
         req_id,
@@ -122,3 +158,10 @@ def get_llm_engine() -> AsyncLLMEngine:
     if llm_engine is None:
         raise RuntimeError("LLM engine not initialized")
     return llm_engine
+
+
+def get_add_request_signature_str() -> str:
+    """Optional helper for debugging via API."""
+    if llm_engine is None:
+        return "<engine not initialized>"
+    return str(inspect.signature(llm_engine.add_request))

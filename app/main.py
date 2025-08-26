@@ -11,6 +11,7 @@ from app.inference import (
     generate_chat_response,
     rerank_documents,
     get_llm_engine,
+    get_add_request_signature_str,
 )
 from app.schemas import (
     ChatRequest,
@@ -44,6 +45,16 @@ def health():
 def root():
     return {"ok": True, "service": "frontoffice-llm"}
 
+# Debug: see the detected add_request signature at runtime
+@app.get("/__debug_sig")
+def debug_sig():
+    try:
+        engine = get_llm_engine()
+        sig = get_add_request_signature_str()
+        return {"add_request_signature": sig}
+    except Exception as e:
+        return {"error": str(e)}
+
 @app.post("/chat", response_model=ChatResponse)
 async def chat(req: ChatRequest):
     text = await generate_chat_response(
@@ -73,17 +84,30 @@ async def chat_stream(req: ChatRequest, request: Request):
         stop=req.stop or [],
     )
 
+    # Detect the right variant for this build
+    sig = inspect.signature(engine.add_request)
+    names = list(sig.parameters.keys())
+
+    async def add_request(prompt, params):
+        if "request_id" in names:
+            # choose correct keyword for SamplingParams
+            rid = __import__("uuid").uuid4().hex
+            if "params" in names:
+                return await engine.add_request(request_id=rid, prompt=prompt, params=params)
+            elif "sampling_params" in names:
+                return await engine.add_request(request_id=rid, prompt=prompt, sampling_params=params)
+            else:
+                return await engine.add_request(rid, prompt, params)
+        elif "params" in names:
+            return await engine.add_request(prompt=prompt, params=params)
+        elif "sampling_params" in names:
+            return await engine.add_request(prompt=prompt, sampling_params=params)
+        else:
+            return await engine.add_request(prompt, params)
+
     async def gen():
         started = time.time()
-
-        # Inspect the signature once, then call the right variant
-        sig = inspect.signature(engine.add_request)
-        if "params" in sig.parameters:
-            req_id = await engine.add_request(prompt=req.prompt, params=params)
-        elif "sampling_params" in sig.parameters:
-            req_id = await engine.add_request(prompt=req.prompt, sampling_params=params)
-        else:
-            req_id = await engine.add_request(req.prompt, params)
+        req_id = await add_request(req.prompt, params)
 
         # Emit a started event (helps clients correlate/cancel)
         yield f'data: {json.dumps({"type":"started","request_id":req_id})}\n\n'
