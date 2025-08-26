@@ -4,9 +4,9 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1
 
-# curl for start.sh readiness checks
+# Curl for readiness checks in start.sh
 RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certificates \
-    && rm -rf /var/lib/apt/lists/*
+  && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
@@ -18,4 +18,6 @@ COPY start.sh /app/start.sh
 RUN chmod +x /app/start.sh
 
 EXPOSE 8000
-CMD ["/app/start.sh"]
+
+# IMPORTANT: override base entrypoint so our script runs
+ENTRYPOINT ["/app/start.sh"]
