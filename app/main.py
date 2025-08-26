@@ -1,6 +1,7 @@
 # app/main.py
 import json
 import time
+import inspect
 from fastapi import FastAPI, Request
 from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -75,14 +76,14 @@ async def chat_stream(req: ChatRequest, request: Request):
     async def gen():
         started = time.time()
 
-        # vLLM signature compatibility: positional -> params= -> legacy sampling_params=
-        try:
+        # Inspect the signature once, then call the right variant
+        sig = inspect.signature(engine.add_request)
+        if "params" in sig.parameters:
+            req_id = await engine.add_request(prompt=req.prompt, params=params)
+        elif "sampling_params" in sig.parameters:
+            req_id = await engine.add_request(prompt=req.prompt, sampling_params=params)
+        else:
             req_id = await engine.add_request(req.prompt, params)
-        except TypeError:
-            try:
-                req_id = await engine.add_request(prompt=req.prompt, params=params)
-            except TypeError:
-                req_id = await engine.add_request(prompt=req.prompt, sampling_params=params)
 
         # Emit a started event (helps clients correlate/cancel)
         yield f'data: {json.dumps({"type":"started","request_id":req_id})}\n\n'

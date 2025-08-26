@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import inspect
 from typing import List, Optional, Tuple
 
 import torch
@@ -52,6 +53,29 @@ def load_models() -> None:
     reranker_model = CrossEncoder(rr_model_id, device=rr_device)
 
 
+async def _add_request_compat(prompt: str, params: SamplingParams):
+    """
+    Call vLLM add_request with whatever signature this build expects:
+      - prompt=..., params=...
+      - prompt=..., sampling_params=...
+      - positional (prompt, params)
+    """
+    if llm_engine is None:
+        raise RuntimeError("LLM engine not initialized")
+
+    sig = inspect.signature(llm_engine.add_request)
+    param_names = list(sig.parameters.keys())
+
+    # Prefer explicit keyword names if available
+    if "params" in sig.parameters:
+        return await llm_engine.add_request(prompt=prompt, params=params)
+    if "sampling_params" in sig.parameters:
+        return await llm_engine.add_request(prompt=prompt, sampling_params=params)
+
+    # Fallback: positional (prompt, params)
+    return await llm_engine.add_request(prompt, params)
+
+
 async def generate_chat_response(
     prompt: str,
     *,
@@ -71,17 +95,7 @@ async def generate_chat_response(
         stop=stop or [],
     )
 
-    # Try all known vLLM signatures in a safe order:
-    # 1) positional (prompt, params)      [V1]
-    # 2) keyword   (prompt=..., params=)  [V1 keyword-only]
-    # 3) legacy    (prompt=..., sampling_params=...)
-    try:
-        req_id = await llm_engine.add_request(prompt, params)
-    except TypeError:
-        try:
-            req_id = await llm_engine.add_request(prompt=prompt, params=params)
-        except TypeError:
-            req_id = await llm_engine.add_request(prompt=prompt, sampling_params=params)
+    req_id = await _add_request_compat(prompt, params)
 
     out = await llm_engine.get_request_output(
         req_id,
