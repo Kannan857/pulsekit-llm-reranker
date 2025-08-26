@@ -25,7 +25,7 @@ from vllm.sampling_params import SamplingParams
 
 app = FastAPI(title="Front Office LLM (Quant) + Mini Reranker")
 
-# --- CORS (adjust allow_origins to your domains in prod) ---
+# CORS (relax for now; tighten in prod)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -67,7 +67,7 @@ def rerank(req: RerankRequest):
         results=[RerankResponseItem(document=d, score=float(s)) for d, s in ranked]
     )
 
-# ---------- Streaming SSE endpoint (V1 collector-based) ----------
+# ---------- Streaming SSE endpoint (use get_generator(request_id)) ----------
 @app.post("/chat/stream")
 async def chat_stream(req: ChatRequest, request: Request):
     engine = get_llm_engine()
@@ -78,42 +78,46 @@ async def chat_stream(req: ChatRequest, request: Request):
         stop=req.stop or [],
     )
 
-    # Figure out the proper add_request signature for this build
+    # Build-compatible add_request -> request_id
     sig = inspect.signature(engine.add_request)
     names = list(sig.parameters.keys())
 
-    async def add_request(prompt, params):
+    def enqueue(prompt, params) -> str:
         if "request_id" in names:
             rid = uuid.uuid4().hex
             if "params" in names:
-                collector = await engine.add_request(request_id=rid, prompt=prompt, params=params)
+                engine.add_request(request_id=rid, prompt=prompt, params=params)
             elif "sampling_params" in names:
-                collector = await engine.add_request(request_id=rid, prompt=prompt, sampling_params=params)
+                engine.add_request(request_id=rid, prompt=prompt, sampling_params=params)
             else:
-                collector = await engine.add_request(rid, prompt, params)
-            return collector, rid
+                engine.add_request(rid, prompt, params)
+            return rid
         elif "params" in names:
-            collector = await engine.add_request(prompt=prompt, params=params)
-            return collector, getattr(collector, "request_id", uuid.uuid4().hex)
+            engine.add_request(prompt=prompt, params=params)
+            return uuid.uuid4().hex
         elif "sampling_params" in names:
-            collector = await engine.add_request(prompt=prompt, sampling_params=params)
-            return collector, getattr(collector, "request_id", uuid.uuid4().hex)
+            engine.add_request(prompt=prompt, sampling_params=params)
+            return uuid.uuid4().hex
         else:
-            collector = await engine.add_request(prompt, params)
-            return collector, getattr(collector, "request_id", uuid.uuid4().hex)
+            engine.add_request(prompt, params)
+            return uuid_uuid4().hex  # typofix below
+
+    # (tiny typo safety)
+    def uuid_uuid4():  # just in case of previous branch
+        return uuid.uuid4().hex
+
+    request_id = enqueue(req.prompt, params)
 
     async def gen():
         started = time.time()
-        collector, rid = await add_request(req.prompt, params)
-
-        # Emit a started event
-        yield f'data: {json.dumps({"type":"started","request_id":rid})}\n\n'
+        # Emit started with the request_id we generated
+        yield f'data: {json.dumps({"type":"started","request_id":request_id})}\n\n'
 
         prev = ""
         last = None
         try:
-            # Stream directly from the collector (V1 pattern)
-            async for out in collector:
+            # Stream from engine.get_generator(request_id) — portable across V1 builds
+            async for out in engine.get_generator(request_id):
                 last = out
                 text_so_far = out.outputs[0].text
                 delta = text_so_far[len(prev):]
@@ -121,15 +125,14 @@ async def chat_stream(req: ChatRequest, request: Request):
                     prev = text_so_far
                     yield f'data: {json.dumps({"type":"delta","delta":delta})}\n\n'
 
-                # client closed connection (barge-in) -> done
+                # client closed connection (barge-in)
                 if await request.is_disconnected():
                     try:
-                        await engine.abort_request(rid)
+                        await engine.abort_request(request_id)
                     except Exception:
                         pass
                     return
 
-            # Final usage if available
             usage = {}
             if last and getattr(last, "metrics", None):
                 m = last.metrics

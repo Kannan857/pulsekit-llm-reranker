@@ -4,7 +4,7 @@ from __future__ import annotations
 import os
 import uuid
 import inspect
-from typing import List, Optional, Tuple, Any
+from typing import List, Optional, Tuple
 
 import torch
 from dotenv import load_dotenv
@@ -54,98 +54,41 @@ def load_models() -> None:
     reranker_model = CrossEncoder(rr_model_id, device=rr_device)
 
 
-def _make_add_request_caller():
+def _call_add_request(prompt: str, params: SamplingParams) -> str:
     """
-    Detect and return a function that calls llm_engine.add_request with the
-    right signature and returns (collector, request_id).
+    Call llm_engine.add_request with the correct signature for this build,
+    return the request_id to be used with get_generator(request_id).
     """
     if llm_engine is None:
         raise RuntimeError("LLM engine not initialized")
 
     sig = inspect.signature(llm_engine.add_request)
     names = list(sig.parameters.keys())
+    rid = uuid.uuid4().hex
 
-    # Variant A: request_id is required (your build)
+    # V1: requires request_id
     if "request_id" in names:
         if "params" in names:
-            async def caller(prompt, params):
-                rid = uuid.uuid4().hex
-                collector = await llm_engine.add_request(
-                    request_id=rid, prompt=prompt, params=params
-                )
-                return collector, rid
-            return caller
+            # (request_id=, prompt=, params=)
+            return (lambda: llm_engine.add_request(request_id=rid, prompt=prompt, params=params))() or rid
         elif "sampling_params" in names:
-            async def caller(prompt, params):
-                rid = uuid.uuid4().hex
-                collector = await llm_engine.add_request(
-                    request_id=rid, prompt=prompt, sampling_params=params
-                )
-                return collector, rid
-            return caller
+            # (request_id=, prompt=, sampling_params=)
+            return (lambda: llm_engine.add_request(request_id=rid, prompt=prompt, sampling_params=params))() or rid
         else:
-            async def caller(prompt, params):
-                rid = uuid.uuid4().hex
-                collector = await llm_engine.add_request(rid, prompt, params)
-                return collector, rid
-            return caller
+            # positional (request_id, prompt, params)
+            return (lambda: llm_engine.add_request(rid, prompt, params))() or rid
 
-    # Variant B: no request_id, keyword 'params'
+    # No request_id in signature (older variants)
     if "params" in names:
-        async def caller(prompt, params):
-            collector = await llm_engine.add_request(prompt=prompt, params=params)
-            rid = getattr(collector, "request_id", uuid.uuid4().hex)
-            return collector, rid
-        return caller
-
-    # Variant C: no request_id, legacy 'sampling_params'
+        (lambda: llm_engine.add_request(prompt=prompt, params=params))()
+        return rid
     if "sampling_params" in names:
-        async def caller(prompt, params):
-            collector = await llm_engine.add_request(prompt=prompt, sampling_params=params)
-            rid = getattr(collector, "request_id", uuid.uuid4().hex)
-            return collector, rid
-        return caller
+        (lambda: llm_engine.add_request(prompt=prompt, sampling_params=params))()
+        return rid
 
-    # Variant D: positional only (prompt, params)
-    async def caller(prompt, params):
-        collector = await llm_engine.add_request(prompt, params)
-        rid = getattr(collector, "request_id", uuid.uuid4().hex)
-        return collector, rid
-
-    return caller
-
-
-async def _collector_to_final_text(collector: Any) -> str:
-    """
-    Consume a RequestOutputCollector and return the final text.
-    Works whether the collector is async-iterable or exposes a get_final_output().
-    """
-    # Prefer async iteration (most V1 collectors support this)
-    try:
-        last = None
-        async for out in collector:
-            last = out
-        if last is not None:
-            return last.outputs[0].text
-    except TypeError:
-        # Not async-iterable; fall back to method calls
-        pass
-
-    # Try get_final_output()
-    if hasattr(collector, "get_final_output"):
-        out = await collector.get_final_output()
-        return out.outputs[0].text
-
-    # Try wait() or result() patterns (very defensive)
-    if hasattr(collector, "wait"):
-        out = await collector.wait()
-        return out.outputs[0].text
-    if hasattr(collector, "result"):
-        out = await collector.result()
-        return out.outputs[0].text
-
-    # As a last resort, raise a helpful error
-    raise RuntimeError("Unknown collector interface; cannot obtain final output.")
+    # positional (prompt, params)
+    (lambda: llm_engine.add_request(prompt, params))()
+    return rid
 
 
 async def generate_chat_response(
@@ -167,11 +110,16 @@ async def generate_chat_response(
         stop=stop or [],
     )
 
-    add_request = _make_add_request_caller()
-    collector, _ = await add_request(prompt, params)
+    # Enqueue request and get a request_id we can stream with
+    request_id = _call_add_request(prompt, params)
 
-    # Consume collector to final text (no get_request_output in V1)
-    return await _collector_to_final_text(collector)
+    # Consume via engine.get_generator(request_id) to be compatible with V1
+    last = None
+    async for out in llm_engine.get_generator(request_id):
+        last = out
+    if last is None:
+        raise RuntimeError("No output received from vLLM generator.")
+    return last.outputs[0].text
 
 
 def rerank_documents(
