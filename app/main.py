@@ -75,11 +75,14 @@ async def chat_stream(req: ChatRequest, request: Request):
     async def gen():
         started = time.time()
 
-        # vLLM V1 prefers positional (prompt, params). Older engines used sampling_params=...
+        # vLLM signature compatibility: positional -> params= -> legacy sampling_params=
         try:
-            req_id = await engine.add_request(req.prompt, params)  # V1 style
+            req_id = await engine.add_request(req.prompt, params)
         except TypeError:
-            req_id = await engine.add_request(prompt=req.prompt, sampling_params=params)  # legacy
+            try:
+                req_id = await engine.add_request(prompt=req.prompt, params=params)
+            except TypeError:
+                req_id = await engine.add_request(prompt=req.prompt, sampling_params=params)
 
         # Emit a started event (helps clients correlate/cancel)
         yield f'data: {json.dumps({"type":"started","request_id":req_id})}\n\n'

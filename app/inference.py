@@ -71,11 +71,21 @@ async def generate_chat_response(
         stop=stop or [],
     )
 
-    # vLLM 0.8.x (V1): pass SamplingParams positionally (prompt, params)
-    req_id = await llm_engine.add_request(prompt, params)
+    # Try all known vLLM signatures in a safe order:
+    # 1) positional (prompt, params)      [V1]
+    # 2) keyword   (prompt=..., params=)  [V1 keyword-only]
+    # 3) legacy    (prompt=..., sampling_params=...)
+    try:
+        req_id = await llm_engine.add_request(prompt, params)
+    except TypeError:
+        try:
+            req_id = await llm_engine.add_request(prompt=prompt, params=params)
+        except TypeError:
+            req_id = await llm_engine.add_request(prompt=prompt, sampling_params=params)
 
     out = await llm_engine.get_request_output(
-        req_id, timeout=float(_env("VLLM_TIMEOUT", "90"))
+        req_id,
+        timeout=float(_env("VLLM_TIMEOUT", "90")),
     )
     return out.outputs[0].text
 
@@ -85,6 +95,7 @@ def rerank_documents(
     documents: List[str],
     top_k: Optional[int] = None,
 ) -> List[Tuple[str, float]]:
+    """Lightweight cross-encoder reranking (CPU by default)."""
     if reranker_model is None or not documents:
         return []
     pairs = [[query, d] for d in documents]
