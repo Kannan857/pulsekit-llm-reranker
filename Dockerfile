@@ -1,23 +1,15 @@
 FROM vllm/vllm-openai:v0.8.4
 
-ENV PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1 \
-    PIP_NO_CACHE_DIR=1
-
-# Curl for readiness checks in start.sh
-RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certificates \
-  && rm -rf /var/lib/apt/lists/*
-
 WORKDIR /app
-
-COPY requirements.txt /app/
-RUN pip install --no-cache-dir -r requirements.txt
-
 COPY app /app/app
 COPY start.sh /app/start.sh
 RUN chmod +x /app/start.sh
 
-EXPOSE 8000
+# Only safe, minimal deps:
+# - httpx for proxying to vLLM
+# - sentence-transformers WITHOUT deps (use base image's transformers/torch)
+RUN pip install --no-cache-dir httpx==0.27.0 && \
+    pip install --no-cache-dir --no-deps sentence-transformers==3.0.1
 
-# IMPORTANT: override base entrypoint so our script runs
+EXPOSE 8000
 ENTRYPOINT ["/app/start.sh"]
