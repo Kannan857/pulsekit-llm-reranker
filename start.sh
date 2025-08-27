@@ -27,9 +27,8 @@ echo ">>> Starting vLLM OpenAI server on :$VLLM_PORT (model=$LLM_MODEL, quant=$L
   ${LLM_QUANTIZATION:+--quantization "$LLM_QUANTIZATION"} \
   --tensor-parallel-size "$VLLM_TP" \
   --max-model-len "$VLLM_MAX_LEN" \
-  --gpu-memory-utilization 0.95 \
+  --gpu-memory-utilization "${VLLM_GPU_UTIL:-0.95}" \
   --enable-prefix-caching \
-  --cuda-graph \
   --host 0.0.0.0 --port "$VLLM_PORT" \
   --disable-log-requests --disable-log-stats &
 
