@@ -83,6 +83,13 @@ def _pick(val, *fallbacks):
             return v
     return None
 
+def _parse_stops(s: str | None, fallback: list[str]) -> list[str]:
+    if not s: return fallback
+    return [x for x in (t.strip() for t in s.split(",")) if x]
+
+VOICE_STOPS = _parse_stops(os.getenv("VOICE_STOPS"), ["\n\n","</s>"])
+CHAT_STOPS  = _parse_stops(os.getenv("CHAT_STOPS"),  ["</s>"])
+
 def _resolve_gen_params(channel: str, req: ChatRequest) -> GenerationParams:
     # Caller-supplied per-channel defaults (middle precedence)
     chan_defaults: Optional[GenerationParams] = None
@@ -98,14 +105,14 @@ def _resolve_gen_params(channel: str, req: ChatRequest) -> GenerationParams:
             temperature=VOICE_TEMPERATURE_DEFAULT,
             top_p=VOICE_TOPP_DEFAULT,
             max_tokens=VOICE_MAX_TOKENS_DEFAULT,
-            stop=DEFAULT_STOPS,
+            stop=VOICE_STOPS,
         )
     else:
         server_defaults = GenerationParams(
             temperature=CHAT_TEMPERATURE_DEFAULT,
             top_p=CHAT_TOPP_DEFAULT,
             max_tokens=CHAT_MAX_TOKENS_DEFAULT,
-            stop=DEFAULT_STOPS,
+            stop=CHAT_STOPS,
         )
 
     # Highest precedence: per-request overrides
